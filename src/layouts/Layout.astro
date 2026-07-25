@@ -1,0 +1,61 @@
+---
+import '../styles/global.css';
+
+interface Props {
+	title: string;
+	description?: string;
+	/** Canonical path, e.g. `/blog/amber-signal-1234`. */
+	path?: string;
+	/** Rendered as `article` for live blogs so social cards show a timestamp. */
+	ogType?: 'website' | 'article';
+	publishedTime?: number | null;
+	noindex?: boolean;
+}
+
+const {
+	title,
+	description = 'A newsroom-style live blog built on Cloudflare Workers and Durable Objects.',
+	path = Astro.url.pathname,
+	ogType = 'website',
+	publishedTime = null,
+	noindex = false,
+} = Astro.props;
+
+const canonical = new URL(path, Astro.site ?? Astro.url.origin).toString();
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>{title}</title>
+		<meta name="description" content={description} />
+		<link rel="canonical" href={canonical} />
+		{noindex && <meta name="robots" content="noindex" />}
+
+		<meta property="og:type" content={ogType} />
+		<meta property="og:title" content={title} />
+		<meta property="og:description" content={description} />
+		<meta property="og:url" content={canonical} />
+		{publishedTime && <meta property="article:published_time" content={new Date(publishedTime).toISOString()} />}
+		<meta name="twitter:card" content="summary_large_image" />
+
+		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+		<slot name="head" />
+	</head>
+	<body>
+		<a class="skip-link" href="#main">Skip to content</a>
+		<slot />
+		<footer class="site-footer">
+			<p>
+				Built on <a href="https://developers.cloudflare.com/workers/">Cloudflare Workers</a>,
+				<a href="https://developers.cloudflare.com/durable-objects/">Durable Objects</a>, and
+				<a href="https://astro.build/">Astro</a>.
+			</p>
+			<p>
+				<a href="https://github.com/Gryczka/cloudflare-live-blog">Source on GitHub</a>
+			</p>
+		</footer>
+	</body>
+</html>

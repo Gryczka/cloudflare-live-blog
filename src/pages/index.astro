@@ -1,0 +1,123 @@
+---
+import Layout from '../layouts/Layout.astro';
+import CreateBlogScript from '../components/scripts/CreateBlogScript.astro';
+
+// Fully static content — no per-request work, so this can be cached hard.
+Astro.response.headers.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=3600');
+---
+
+<Layout title="Live Blog — Cloudflare Workers + Durable Objects" path="/">
+	<main class="hero" id="main">
+		<span class="hero__eyebrow">Cloudflare Developer Platform</span>
+		<h1 class="hero__title">Live blogging, one Durable Object at a time</h1>
+		<p class="hero__lede">
+			Start a live blog, share the reader link, and publish updates that appear instantly for
+			everyone watching. No accounts, no database, no message broker.
+		</p>
+	</main>
+
+	<section class="card">
+		<h2 class="card__title">Start a live blog</h2>
+		<p class="card__hint">
+			You will get two links: a public reader link, and a private author link that carries your
+			editing key.
+		</p>
+
+		<form data-create-form>
+			<label class="field">
+				<span class="field__label">Title</span>
+				<input
+					class="input"
+					type="text"
+					name="title"
+					maxlength="140"
+					required
+					placeholder="Election night 2026"
+					autocomplete="off"
+				/>
+			</label>
+
+			<label class="field">
+				<span class="field__label">Standfirst <span class="field__optional">(optional)</span></span>
+				<input
+					class="input"
+					type="text"
+					name="summary"
+					maxlength="280"
+					placeholder="Results, reaction, and analysis as they land."
+					autocomplete="off"
+				/>
+			</label>
+
+			<button class="button button--primary" type="submit" data-create-submit>
+				Create live blog
+			</button>
+
+			<p class="notice notice--error" data-create-error hidden></p>
+		</form>
+
+		<div data-create-result hidden>
+			<p class="notice notice--success">
+				Live blog created. Keep the author link private — it is the only way to publish.
+			</p>
+			<div class="share-box">
+				<label class="field">
+					<span class="field__label">Reader link (share this)</span>
+					<span class="share-box__row">
+						<input class="input" type="text" readonly data-reader-url />
+						<button class="button button--small" type="button" data-copy="reader">Copy</button>
+					</span>
+				</label>
+				<label class="field">
+					<span class="field__label">Author link (keep this)</span>
+					<span class="share-box__row">
+						<input class="input" type="text" readonly data-author-url />
+						<button class="button button--small" type="button" data-copy="author">Copy</button>
+					</span>
+				</label>
+			</div>
+			<p><a class="button button--primary" data-open-author href="/">Open the author console</a></p>
+		</div>
+	</section>
+
+	<ul class="features">
+		<li class="feature">
+			<h3 class="feature__title">One object per blog</h3>
+			<p class="feature__body">
+				<code>idFromName(blogId)</code> routes every reader and author of a blog to the same
+				instance globally, so ordering is just an incrementing integer.
+			</p>
+		</li>
+		<li class="feature">
+			<h3 class="feature__title">Hibernatable sockets</h3>
+			<p class="feature__body">
+				Connections stay open while the object sleeps. Keep-alive pings are answered by the
+				runtime without waking it.
+			</p>
+		</li>
+		<li class="feature">
+			<h3 class="feature__title">Resumable by cursor</h3>
+			<p class="feature__body">
+				Every change gets a monotonic sequence number, so a reconnecting reader replays exactly
+				what it missed instead of re-downloading the feed.
+			</p>
+		</li>
+		<li class="feature">
+			<h3 class="feature__title">Server-rendered first paint</h3>
+			<p class="feature__body">
+				The feed is rendered on the server from SQLite. The browser downloads one small script,
+				not a UI framework.
+			</p>
+		</li>
+	</ul>
+
+	<CreateBlogScript />
+</Layout>
+
+<style>
+	.field__optional {
+		font-weight: 400;
+		text-transform: none;
+		letter-spacing: 0;
+	}
+</style>

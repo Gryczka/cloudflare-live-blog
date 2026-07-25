@@ -1,0 +1,103 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "cloudflare-live-blog",
+
+	/**
+	 * Custom Worker entrypoint.
+	 *
+	 * The Astro Cloudflare adapter normally owns the Worker entrypoint. We take it
+	 * over so we can do two things the framework cannot:
+	 *
+	 *   1. Export the LiveBlog Durable Object class (Wrangler needs a named export).
+	 *   2. Answer WebSocket upgrades ourselves, returning a 101 with a `webSocket`
+	 *      property. That response shape does not survive a framework render path,
+	 *      so `/api/blog/*` is handled before Astro ever sees the request.
+	 *
+	 * Everything else is delegated to Astro via `handle()` from
+	 * `@astrojs/cloudflare/handler`. See src/worker.ts.
+	 */
+	"main": "./src/worker.ts",
+
+	/**
+	 * `web_socket_auto_reply_to_close` is enabled by default on compatibility dates
+	 * on or after 2026-04-07. It makes the runtime complete the WebSocket close
+	 * handshake for us, so `webSocketClose` no longer has to call `ws.close()` with
+	 * a code that may be reserved (1005/1006 throw).
+	 */
+	"compatibility_date": "2026-07-01",
+	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+
+	"assets": {
+		"binding": "ASSETS",
+		"directory": "./dist"
+	},
+
+	"observability": {
+		"enabled": true
+	},
+
+	/**
+	 * One Durable Object per live blog. `idFromName(blogId)` is deterministic, so
+	 * every reader and author of a given blog lands on the same instance globally —
+	 * which is what makes ordering, fan-out, and storage consistent without any
+	 * external database or pub/sub.
+	 */
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "LIVE_BLOG",
+				"class_name": "LiveBlog"
+			}
+		]
+	},
+
+	/**
+	 * SQLite storage backend (`new_sqlite_classes`, not `new_classes`).
+	 *
+	 * This is the recommended backend for all new Durable Object namespaces, and
+	 * creating new key-value-backed namespaces is no longer supported on accounts
+	 * without an existing one. It also gives us 10GB per object, real indexes, and
+	 * an AUTOINCREMENT sequence to build the resume protocol on — none of which the
+	 * KV backend could provide.
+	 */
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["LiveBlog"]
+		}
+	],
+
+	/**
+	 * Edge-layer abuse guardrails.
+	 *
+	 * These are deliberately NOT the authoritative limits. Rate Limiting is
+	 * per-Cloudflare-location and eventually consistent, so it is a cheap first
+	 * filter that keeps junk away from the Durable Object. Hard caps (posts per
+	 * blog, connections per blog, body length) are enforced inside the DO against
+	 * SQLite, where they can actually be counted correctly.
+	 *
+	 * `period` must be either 10 or 60.
+	 */
+	"ratelimits": [
+		{
+			// Writes, keyed on the author's capability-token hash — a stable
+			// identifier, which is what the docs recommend over IP addresses.
+			"name": "WRITE_LIMITER",
+			"namespace_id": "2001",
+			"simple": {
+				"limit": 30,
+				"period": 60
+			}
+		},
+		{
+			// Blog creation, keyed on IP. Creation is the one place we have no
+			// stable identifier yet, so IP is the only option available.
+			"name": "CREATE_LIMITER",
+			"namespace_id": "2002",
+			"simple": {
+				"limit": 5,
+				"period": 60
+			}
+		}
+	]
+}

@@ -1,0 +1,19 @@
+{
+	"extends": "astro/tsconfigs/strict",
+	"include": [".astro/types.d.ts", "**/*"],
+	/**
+	 * `test` is excluded on purpose. Test files need
+	 * `@cloudflare/vitest-pool-workers/types` for the `cloudflare:test` module, which
+	 * the application code must not see. They are checked separately against
+	 * test/tsconfig.json — see the `check` script in package.json.
+	 */
+	"exclude": ["dist", "node_modules", "test", "scripts"],
+	"compilerOptions": {
+		"jsx": "react-jsx",
+		"jsxImportSource": "preact",
+		"types": ["./worker-configuration.d.ts"],
+		"strictNullChecks": true,
+		"noUncheckedIndexedAccess": true,
+		"verbatimModuleSyntax": true
+	}
+}

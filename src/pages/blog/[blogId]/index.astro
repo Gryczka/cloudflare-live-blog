@@ -1,0 +1,162 @@
+---
+/**
+ * The reader page.
+ *
+ * The entire feed is rendered here, on the server, from the Durable Object. That
+ * is the single most consequential difference from the previous implementation:
+ * the largest element on the page is present in the initial HTML, so LCP no
+ * longer waits on a JavaScript bundle to download, hydrate, and fetch.
+ *
+ * The only client-side JavaScript is src/islands/live-feed.ts, which patches this
+ * markup as events arrive over the WebSocket.
+ */
+import Layout from '../../../layouts/Layout.astro';
+import NotFound from '../../../components/NotFound.astro';
+import LiveFeedScript from '../../../components/scripts/LiveFeedScript.astro';
+import { loadSnapshot } from '../../../lib/server/blog';
+import { renderKeyEvent, renderPost } from '../../../lib/render-post';
+import { toPlainText } from '../../../lib/markdown';
+
+const { blogId, snapshot, error } = await loadSnapshot(Astro.params.blogId);
+
+if (!snapshot) {
+	Astro.response.status = 404;
+}
+
+const meta = snapshot?.meta;
+const description = meta
+	? meta.summary || toPlainText(snapshot.posts[0]?.body ?? '', 155) || `Live coverage: ${meta.title}`
+	: 'Live blog not found.';
+
+// Never cache a 404, and keep live pages fresh. A short shared-cache window is
+// safe here because a reader whose HTML is a few seconds stale resumes from the
+// embedded `seq` and the socket immediately replays anything it missed — staleness
+// is invisible rather than wrong.
+Astro.response.headers.set(
+	'Cache-Control',
+	snapshot ? 'public, max-age=5, stale-while-revalidate=30' : 'no-store',
+);
+---
+
+{
+	!snapshot || !meta || !blogId ? (
+		<Layout title="Live blog not found" noindex>
+			<NotFound message={error ?? 'That live blog does not exist.'} />
+		</Layout>
+	) : (
+		<Layout
+			title={`${meta.title} — Live blog`}
+			description={description}
+			path={`/blog/${blogId}`}
+			ogType="article"
+			publishedTime={meta.createdAt}
+		>
+			<Fragment slot="head">
+				<link
+					rel="alternate"
+					type="application/rss+xml"
+					title={`${meta.title} — RSS`}
+					href={`/blog/${blogId}/rss.xml`}
+				/>
+			</Fragment>
+
+			<header class="blog-header">
+				<div class="blog-header__inner">
+					<div class="blog-header__titles">
+						<h1 class="blog-header__title" data-blog-title>{meta.title}</h1>
+						<p class="blog-header__summary" data-blog-summary hidden={!meta.summary}>
+							{meta.summary}
+						</p>
+					</div>
+
+					<div class="blog-header__actions">
+						<span class="status">
+							<span
+								class="status__dot"
+								data-status-dot
+								data-state={meta.status === 'ended' ? 'ended' : 'connecting'}
+								aria-hidden="true"
+							/>
+							<span data-status-label>
+								{meta.status === 'ended' ? 'Coverage ended' : 'Connecting…'}
+							</span>
+						</span>
+
+						<span class="readers" data-reader-count-label aria-label={`${snapshot.readers} reading now`}>
+							<span class="readers__count" data-reader-count>{snapshot.readers}</span>
+							<span>reading</span>
+						</span>
+					</div>
+				</div>
+			</header>
+
+			<button class="new-posts" type="button" data-new-posts hidden>New posts</button>
+
+			<div class="blog-layout">
+				<main
+					class="feed-column"
+					id="main"
+					data-live-feed
+					data-blog-id={blogId}
+					data-seq={snapshot.seq}
+					data-status={meta.status}
+				>
+					<div class="ended-notice" data-ended-notice hidden={meta.status !== 'ended'}>
+						This live blog has ended. The posts below remain as an archive.
+					</div>
+
+					{/*
+					 * `aria-live="polite"` announces posts that arrive while a screen
+					 * reader user is on the page, without interrupting them.
+					 */}
+					<div
+						class="feed"
+						data-feed
+						role="feed"
+						aria-busy="false"
+						aria-label={`Live updates for ${meta.title}`}
+						aria-live="polite"
+					>
+						{snapshot.posts.map((post) => (
+							<Fragment set:html={renderPost(post, { blogId })} />
+						))}
+					</div>
+
+					<div class="empty-state" data-empty-state hidden={snapshot.posts.length > 0}>
+						<p>No posts yet. This live blog is ready and waiting.</p>
+					</div>
+
+					{snapshot.hasMore && (
+						<div class="feed-actions">
+							<button class="button" type="button" data-load-more>Load earlier posts</button>
+						</div>
+					)}
+				</main>
+
+				<aside class="sidebar">
+					<section class="panel" data-key-events-panel hidden={snapshot.pinned.length === 0}>
+						<h2 class="panel__title">Key events</h2>
+						<ul class="key-events" data-key-events>
+							{snapshot.pinned.map((post) => (
+								<Fragment set:html={renderKeyEvent(post, blogId)} />
+							))}
+						</ul>
+					</section>
+
+					<section class="panel">
+						<h2 class="panel__title">About this feed</h2>
+						<p class="card__hint">
+							Updates arrive over a WebSocket served by a single Durable Object, so every
+							reader sees the same ordering.
+						</p>
+						<p class="card__hint">
+							<a href={`/blog/${blogId}/rss.xml`}>Subscribe via RSS</a>
+						</p>
+					</section>
+				</aside>
+			</div>
+
+			<LiveFeedScript />
+		</Layout>
+	)
+}

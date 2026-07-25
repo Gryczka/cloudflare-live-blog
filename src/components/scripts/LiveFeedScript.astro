@@ -1,0 +1,18 @@
+---
+/**
+ * Loads the reader island.
+ *
+ * This lives in its own component so the emitted chunk has an unambiguous name.
+ * Astro derives the bundle name for an inline `<script>` from the file containing
+ * it, and this project has two pages named `index.astro` (`src/pages/index.astro`
+ * and `src/pages/blog/[blogId]/index.astro`), which would otherwise produce two
+ * chunks with identical names.
+ *
+ * Astro does disambiguate them correctly, so this is defensive rather than a fix
+ * for an observed failure — but a build artifact whose name does not identify its
+ * source is hard to audit, and auditing what the reader downloads is the point of
+ * this project.
+ */
+---
+
+<script>import '../../islands/live-feed';</script>

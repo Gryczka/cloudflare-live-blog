@@ -1,0 +1,88 @@
+---
+/**
+ * The author console route.
+ *
+ * Note what this page does *not* do: check authorization on the server. It cannot
+ * — the capability token lives in the URL fragment, which browsers never transmit.
+ * That is the point of putting it there, and the trade is deliberate: the shell is
+ * public and useless without a valid key, and every write is authorized inside the
+ * Durable Object against a stored SHA-256 digest.
+ *
+ * So this page renders a shell and lets the island present the key. It is marked
+ * `noindex` and `no-store` because an author URL should never be crawled or cached.
+ */
+import Layout from '../../../layouts/Layout.astro';
+import NotFound from '../../../components/NotFound.astro';
+import AuthorConsole from '../../../components/author/AuthorConsole';
+import { validateBlogId } from '../../../lib/blog-id';
+import { getBlogStub } from '../../../lib/server/blog';
+
+const validation = validateBlogId(Astro.params.blogId);
+
+// Confirm the blog exists so a bad id gets an honest 404 rather than a console
+// that fails mysteriously. This reveals nothing: blog existence is already public.
+let exists = false;
+let title = 'Author console';
+
+if (validation.valid) {
+	const result = await getBlogStub(validation.blogId).getMeta();
+	if (result.ok) {
+		exists = true;
+		title = result.value.title;
+	}
+}
+
+if (!exists) {
+	Astro.response.status = 404;
+}
+
+Astro.response.headers.set('Cache-Control', 'no-store');
+---
+
+{
+	!validation.valid || !exists ? (
+		<Layout title="Live blog not found" noindex>
+			<NotFound message="That live blog does not exist, so there is nothing to author." />
+		</Layout>
+	) : (
+		<Layout title={`Authoring: ${title}`} path={`/blog/${validation.blogId}/author`} noindex>
+			<header class="blog-header">
+				<div class="blog-header__inner">
+					<div class="blog-header__titles">
+						<p class="author-kicker">Author console</p>
+						<h1 class="blog-header__title">{title}</h1>
+					</div>
+					<div class="blog-header__actions">
+						<a class="button button--small" href={`/blog/${validation.blogId}`}>View as reader</a>
+					</div>
+				</div>
+			</header>
+
+			<main class="author-grid" id="main">
+				{/*
+				 * `client:only` rather than `client:load`: this component's first act is
+				 * to read `location.hash`, which does not exist during server rendering.
+				 * Rendering it on the server would produce an "unauthorized" shell that
+				 * then flipped to authorized, which is a worse experience than waiting.
+				 */}
+				<AuthorConsole blogId={validation.blogId} client:only="preact" />
+			</main>
+		</Layout>
+	)
+}
+
+<style>
+	/*
+	 * Only styles for elements in *this* template belong here. Astro scopes these
+	 * with a data attribute, which does not reach markup rendered by the Preact
+	 * island — those classes live in global.css instead.
+	 */
+	.author-kicker {
+		margin: 0;
+		font-size: 0.72rem;
+		font-weight: 700;
+		letter-spacing: 0.07em;
+		text-transform: uppercase;
+		color: var(--accent-ink);
+	}
+</style>

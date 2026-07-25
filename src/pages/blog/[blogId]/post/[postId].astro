@@ -1,0 +1,109 @@
+---
+/**
+ * Permalink page for a single post.
+ *
+ * Live blogs get quoted and shared post by post. Without stable per-post URLs the
+ * only shareable unit is "the whole blog, as it looks right now", which is not
+ * much use to anyone citing a specific update.
+ */
+import Layout from '../../../../layouts/Layout.astro';
+import NotFound from '../../../../components/NotFound.astro';
+import { validateBlogId } from '../../../../lib/blog-id';
+import { getBlogStub } from '../../../../lib/server/blog';
+import { toPlainText } from '../../../../lib/markdown';
+import { renderPost } from '../../../../lib/render-post';
+import type { BlogMeta, Post } from '../../../../lib/protocol';
+
+const validation = validateBlogId(Astro.params.blogId);
+const postId = Astro.params.postId ?? '';
+
+let post: Post | null = null;
+let meta: BlogMeta | null = null;
+let error = 'That post does not exist.';
+
+if (validation.valid && postId) {
+	const stub = getBlogStub(validation.blogId);
+	const [postResult, metaResult] = await Promise.all([stub.getPost(postId), stub.getMeta()]);
+	if (postResult.ok && metaResult.ok) {
+		post = postResult.value;
+		meta = metaResult.value;
+	} else if (!postResult.ok) {
+		error = postResult.error;
+	}
+}
+
+if (!post || !meta) {
+	Astro.response.status = 404;
+}
+
+// A permalink is immutable enough to cache, but the post can still be corrected,
+// so keep the window short.
+Astro.response.headers.set(
+	'Cache-Control',
+	post ? 'public, max-age=30, stale-while-revalidate=300' : 'no-store',
+);
+
+const blogId = validation.valid ? validation.blogId : null;
+const excerpt = post ? toPlainText(post.body, 155) : '';
+---
+
+{
+	!post || !meta || !blogId ? (
+		<Layout title="Post not found" noindex>
+			<NotFound message={error} />
+		</Layout>
+	) : (
+		<Layout
+			title={`${excerpt || 'Update'} — ${meta.title}`}
+			description={excerpt || `An update from ${meta.title}.`}
+			path={`/blog/${blogId}/post/${post.id}`}
+			ogType="article"
+			publishedTime={post.createdAt}
+		>
+			<header class="blog-header">
+				<div class="blog-header__inner">
+					<div class="blog-header__titles">
+						<p class="permalink-kicker">
+							<a href={`/blog/${blogId}`}>&larr; {meta.title}</a>
+						</p>
+						<h1 class="blog-header__title">A single update</h1>
+					</div>
+				</div>
+			</header>
+
+			<main class="permalink" id="main">
+				<Fragment set:html={renderPost(post, { blogId, standalone: true })} />
+
+				<p class="permalink-back">
+					<a class="button" href={`/blog/${blogId}`}>Read the full live blog</a>
+				</p>
+			</main>
+		</Layout>
+	)
+}
+
+<style>
+	.permalink {
+		max-width: 44rem;
+		margin: 0 auto;
+		padding: 2rem 1.25rem 4rem;
+	}
+
+	.permalink-kicker {
+		margin: 0 0 0.15rem;
+		font-size: 0.85rem;
+	}
+
+	.permalink-kicker a {
+		color: var(--text-muted);
+		text-decoration: none;
+	}
+
+	.permalink-kicker a:hover {
+		text-decoration: underline;
+	}
+
+	.permalink-back {
+		margin-top: 2rem;
+	}
+</style>

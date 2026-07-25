@@ -1,0 +1,35 @@
+# build output
+dist/
+.astro/
+
+# dependencies
+node_modules/
+
+# generated Cloudflare types
+worker-configuration.d.ts
+
+# wrangler / local state
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# environment
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+
+# test output
+coverage/
+
+# macOS
+.DS_Store
+
+# editors
+.vscode/
+.idea/
+*.pem

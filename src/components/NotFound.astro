@@ -1,0 +1,22 @@
+---
+interface Props {
+	message?: string;
+}
+
+const { message = 'That page does not exist.' } = Astro.props;
+---
+
+<main class="hero" id="main">
+	<span class="hero__eyebrow">Not found</span>
+	<h1 class="hero__title">Nothing here</h1>
+	<p class="hero__lede">{message}</p>
+	<p class="hero__cta"><a class="button" href="/">Start a live blog</a></p>
+</main>
+
+<style>
+	/* Scoped styles are hashed into the CSP by Astro, so this needs no
+	   `unsafe-inline`. An inline `style` attribute would have. */
+	.hero__cta {
+		margin-top: 1.5rem;
+	}
+</style>
