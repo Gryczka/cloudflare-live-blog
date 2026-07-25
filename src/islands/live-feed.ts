@@ -6,7 +6,7 @@
  * only has to patch it as events arrive.
  *
  * It replaces a Zustand store plus a React tree that, between them, shipped
- * ~477KB of JavaScript and rendered the feed entirely on the client, so nothing
+ * ~364KB of JavaScript and rendered the feed entirely on the client, so nothing
  * was visible until hydration finished and a fetch resolved.
  *
  * Four bugs from that implementation are specifically fixed here.

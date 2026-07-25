@@ -2,7 +2,7 @@
  * Fails the build if the reader page's JavaScript grows past its budget.
  *
  * The reason this exists: the point of rebuilding this project on Astro was that
- * the previous version shipped ~477KB of uncompressed JavaScript to render a list
+ * the previous version shipped ~364KB of uncompressed JavaScript to render a list
  * of text posts. That is exactly the kind of regression that reintroduces itself
  * quietly — someone adds a UI framework component to the reader page, everything
  * still works, and nobody notices until the numbers are embarrassing again.

@@ -95,15 +95,30 @@ the constructor only accepts 200–599.)
 
 ## Reader payload budget
 
-The reason this project was rebuilt. Measured on the deployed reader page, same
-content in both cases:
+The reason this project was rebuilt. Both deployments were seeded with the same six
+posts and measured in the same headless Chrome run, counting what the browser
+actually requested:
 
 | | Previous version (Next.js + OpenNext) | This version (Astro islands) |
 |---|---|---|
-| JavaScript, uncompressed | 476,831 B across 7 chunks | **20,200 B across 2** |
-| JavaScript, gzipped | — | **6.9 KB** |
-| Posts in the server HTML | 0 | all of them |
-| What gates first paint | JS download → hydrate → `fetch` → paint | nothing; HTML contains the feed |
+| Script requests | 6 | **2** |
+| JavaScript, uncompressed | 364,237 B | **20,200 B** |
+| JavaScript, gzipped | 107,736 B | **7,038 B** |
+| Posts in the server HTML | 0 | **6** |
+| Largest Contentful Paint | 1,056 ms | **480 ms** |
+| What gates first paint | JS download → hydrate → `fetch` → paint | nothing; the HTML contains the feed |
+
+A methodology note, because the first number is easy to overstate. The previous
+version's HTML also references a 112,594 B `polyfills` chunk, which would put the
+total at 476,831 B — but it is marked `noModule`, so a current browser skips it. The
+364,237 B figure above is what a modern browser really downloads, and is the fair
+comparison. Counting every `<script src>` in the markup is not.
+
+The LCP figures are the softer half of this table: both pages are fast in absolute
+terms, and a single measurement over the public internet is noisy. The structural
+claim underneath it is the durable one — 0 versus 6 posts in the server HTML means
+the previous version could not paint content until JavaScript had booted, hydrated,
+and completed a fetch, no matter how fast the network was.
 
 A UI framework does appear in this project — Preact powers the author console — but
 only on `/blog/:id/author`, which readers never request. The reader's island is plain
