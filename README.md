@@ -1,5 +1,7 @@
 # Live Blog
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Gryczka/cloudflare-live-blog)
+
 A newsroom-style live blog on Cloudflare Workers. One SQLite-backed Durable Object
 per blog orders every update, fans it out over hibernatable WebSockets, and serves
 the feed as server-rendered HTML — so the reader downloads **19.7 KB of JavaScript**
