@@ -55,6 +55,8 @@ about what was wrong with it, because the interesting content is in the diff.
 
 ## Architecture
 
+![Live Blog Cloudflare architecture](docs/architecture-tile-dark.png)
+
 ```mermaid
 flowchart TB
     Reader["Reader<br/><i>19.7 KB JS island</i>"]
