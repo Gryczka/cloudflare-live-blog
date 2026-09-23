@@ -4,7 +4,7 @@
  * We take over the entrypoint from the Astro adapter (`main` in wrangler.jsonc)
  * for two reasons the framework cannot cover:
  *
- *   1. Wrangler needs a named export of the Durable Object class.
+ *   1. Wrangler needs named exports of the Durable Object classes.
  *   2. A WebSocket upgrade must return a 101 response carrying a `webSocket`
  *      property. That value does not survive a framework render pipeline, so the
  *      whole `/api/blogs/*` surface is answered here, before Astro is consulted.
@@ -19,14 +19,17 @@
 
 import { handle } from '@astrojs/cloudflare/handler';
 
+import { BlogCreationRateLimiter } from './durable-objects/BlogCreationRateLimiter';
 import { LiveBlog } from './durable-objects/LiveBlog';
-import { EDIT_TOKEN_HEADER, hashToken } from './lib/capability';
-import { generateBlogId, isValidBlogId, slugify, validateBlogId } from './lib/blog-id';
-import { blogStub } from './lib/server/blog';
+import { EDIT_TOKEN_HEADER } from './lib/capability';
+import { isValidBlogId, validateBlogId } from './lib/blog-id';
 import { SNAPSHOT_PAGE_SIZE } from './lib/limits';
 import type { Result } from './lib/protocol';
+import { json, readJson } from './lib/server/api-response';
+import { blogStub } from './lib/server/blog';
+import { handleCreateBlog } from './lib/server/create-blog';
 
-export { LiveBlog };
+export { BlogCreationRateLimiter, LiveBlog };
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -71,7 +74,7 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 	// POST /api/blogs — create a live blog
 	if (segments.length === 2) {
 		if (method !== 'POST') return methodNotAllowed('POST');
-		return createBlog(request, env, url);
+		return handleCreateBlog(request, env, url);
 	}
 
 	const blogIdRaw = segments[2] ?? '';
@@ -107,7 +110,6 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 	// PATCH /api/blogs/:id/meta
 	if (rest.length === 1 && rest[0] === 'meta') {
 		if (method !== 'PATCH') return methodNotAllowed('PATCH');
-		if (!(await allowWrite(env, token))) return rateLimited();
 		const body = await readJson<{ title?: string; summary?: string }>(request);
 		if (!body.ok) return json({ error: body.error }, 400);
 		return unwrap(await stub.updateMeta(token, body.value));
@@ -116,7 +118,6 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 	// PUT /api/blogs/:id/status
 	if (rest.length === 1 && rest[0] === 'status') {
 		if (method !== 'PUT') return methodNotAllowed('PUT');
-		if (!(await allowWrite(env, token))) return rateLimited();
 		const body = await readJson<{ status?: string }>(request);
 		if (!body.ok) return json({ error: body.error }, 400);
 		const status = body.value.status;
@@ -129,7 +130,6 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 	// POST /api/blogs/:id/posts
 	if (rest.length === 1 && rest[0] === 'posts') {
 		if (method !== 'POST') return methodNotAllowed('POST');
-		if (!(await allowWrite(env, token))) return rateLimited();
 		const body = await readJson<Record<string, unknown>>(request);
 		if (!body.ok) return json({ error: body.error }, 400);
 		return unwrap(
@@ -150,12 +150,10 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 		if (method === 'GET') return unwrap(await stub.getPost(postId));
 
 		if (method === 'DELETE') {
-			if (!(await allowWrite(env, token))) return rateLimited();
 			return unwrap(await stub.deletePost(token, postId));
 		}
 
 		if (method === 'PATCH') {
-			if (!(await allowWrite(env, token))) return rateLimited();
 			const body = await readJson<Record<string, unknown>>(request);
 			if (!body.ok) return json({ error: body.error }, 400);
 			return unwrap(
@@ -174,81 +172,6 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 	return json({ error: 'Unknown endpoint.' }, 404);
 }
 
-async function createBlog(request: Request, env: Env, url: URL): Promise<Response> {
-	// Blog creation is the one write with no stable caller identity yet, so this
-	// is the only place we fall back to keying a rate limit on IP.
-	const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown';
-	const { success } = await env.CREATE_LIMITER.limit({ key: `create:${ip}` });
-	if (!success) {
-		return json({ error: 'Too many live blogs created from here. Try again in a minute.' }, 429);
-	}
-
-	const body = await readJson<{ title?: string; summary?: string; blogId?: string }>(request);
-	if (!body.ok) return json({ error: body.error }, 400);
-
-	// Prefer an explicit id, then a slug of the title, then a generated one.
-	const requested = body.value.blogId?.trim();
-	let blogId: string;
-	if (requested) {
-		const validation = validateBlogId(requested);
-		if (!validation.valid) return json({ error: validation.error }, 400);
-		blogId = validation.blogId;
-	} else {
-		blogId = (body.value.title ? slugify(body.value.title) : null) ?? generateBlogId();
-	}
-
-	// A generated slug can collide with an existing blog. Fall back to a random id
-	// rather than handing the caller someone else's blog.
-	let stub = blogStub(env, blogId);
-	let created = await stub.createBlog({ blogId, title: body.value.title, summary: body.value.summary });
-
-	if (!created.ok && created.status === 409 && !requested) {
-		blogId = generateBlogId();
-		stub = blogStub(env, blogId);
-		created = await stub.createBlog({ blogId, title: body.value.title, summary: body.value.summary });
-	}
-
-	if (!created.ok) return json({ error: created.error }, created.status);
-
-	console.log(JSON.stringify({ event: 'blog_created', blogId, colo: request.cf?.colo ?? null }));
-
-	return json(
-		{
-			blogId: created.value.blogId,
-			editToken: created.value.editToken,
-			readerUrl: `${url.origin}/blog/${created.value.blogId}`,
-			// The token is in the fragment on purpose — fragments are never sent to
-			// the server, so it stays out of logs, Referer headers, and analytics.
-			authorUrl: `${url.origin}/blog/${created.value.blogId}/author#edit=${created.value.editToken}`,
-		},
-		201,
-	);
-}
-
-/* -------------------------------------------------------------------------- */
-/*                              Rate limiting                                 */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Edge guardrail for writes.
- *
- * Keyed on the SHA-256 of the presented capability token, which the docs
- * recommend over IP addresses: a token identifies one author, whereas an IP can
- * be shared by an entire office or mobile carrier.
- *
- * The raw token is never used as a key — only its digest — so tokens do not end
- * up inside rate limiter state.
- *
- * This is a cheap first filter, not the authoritative limit. Rate Limiting is
- * per-Cloudflare-location and eventually consistent, so totals like "posts per
- * blog" are enforced inside the Durable Object against a real SQL COUNT.
- */
-async function allowWrite(env: Env, token: string | null): Promise<boolean> {
-	const key = token ? `write:${(await hashToken(token)).slice(0, 32)}` : 'write:anonymous';
-	const { success } = await env.WRITE_LIMITER.limit({ key });
-	return success;
-}
-
 /* -------------------------------------------------------------------------- */
 /*                            Response helpers                                */
 /* -------------------------------------------------------------------------- */
@@ -258,42 +181,11 @@ function unwrap<T>(result: Result<T>): Response {
 	return json({ error: result.error }, result.status);
 }
 
-function json(value: unknown, status = 200): Response {
-	return new Response(JSON.stringify(value), {
-		status,
-		headers: {
-			'Content-Type': 'application/json; charset=utf-8',
-			// API responses are per-caller and must never be cached by a shared cache.
-			'Cache-Control': 'no-store',
-		},
-	});
-}
-
 function methodNotAllowed(allow: string): Response {
 	return new Response(JSON.stringify({ error: `Method not allowed. Expected ${allow}.` }), {
 		status: 405,
 		headers: { 'Content-Type': 'application/json; charset=utf-8', Allow: allow },
 	});
-}
-
-function rateLimited(): Response {
-	return json({ error: 'You are publishing too quickly. Give it a few seconds and try again.' }, 429);
-}
-
-async function readJson<T>(request: Request): Promise<Result<T>> {
-	const contentType = request.headers.get('Content-Type') ?? '';
-	if (!contentType.includes('application/json')) {
-		return { ok: false, error: 'Expected a JSON request body.', status: 415 };
-	}
-	try {
-		const parsed = (await request.json()) as T;
-		if (parsed === null || typeof parsed !== 'object') {
-			return { ok: false, error: 'Expected a JSON object.', status: 400 };
-		}
-		return { ok: true, value: parsed };
-	} catch {
-		return { ok: false, error: 'Request body was not valid JSON.', status: 400 };
-	}
 }
 
 /* -------------------------------------------------------------------------- */

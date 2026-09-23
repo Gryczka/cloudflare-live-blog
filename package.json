@@ -5,12 +5,16 @@
   "private": true,
   "description": "A newsroom-style live blog built on Cloudflare Workers, Durable Objects, and Astro islands.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "wrangler types && astro dev",
     "start": "npm run dev",
     "build": "wrangler types && npm run check && astro build",
     "preview": "astro build && wrangler dev",
     "deploy": "astro build && wrangler deploy",
+    "temporary:deploy": "npm run build && wrangler deploy --temporary",
     "check": "astro check && tsc --noEmit -p test/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -30,6 +34,6 @@
     "@types/node": "^26.1.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.10",
-    "wrangler": "^4.114.0"
+    "wrangler": "4.134.0"
   }
 }

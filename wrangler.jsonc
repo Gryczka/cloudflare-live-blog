@@ -8,7 +8,7 @@
 	 * The Astro Cloudflare adapter normally owns the Worker entrypoint. We take it
 	 * over so we can do two things the framework cannot:
 	 *
-	 *   1. Export the LiveBlog Durable Object class (Wrangler needs a named export).
+	 *   1. Export the Durable Object classes (Wrangler needs named exports).
 	 *   2. Answer WebSocket upgrades ourselves, returning a 101 with a `webSocket`
 	 *      property. That response shape does not survive a framework render path,
 	 *      so `/api/blog/*` is handled before Astro ever sees the request.
@@ -37,16 +37,21 @@
 	},
 
 	/**
-	 * One Durable Object per live blog. `idFromName(blogId)` is deterministic, so
-	 * every reader and author of a given blog lands on the same instance globally —
-	 * which is what makes ordering, fan-out, and storage consistent without any
-	 * external database or pub/sub.
+	 * Temporary-account compatibility variant.
+	 *
+	 * Temporary accounts do not support native Rate Limiting bindings. This branch
+	 * therefore uses one SQLite Durable Object per hashed connecting IP for blog
+	 * creation, while authorized write counters live in each LiveBlog object.
 	 */
 	"durable_objects": {
 		"bindings": [
 			{
 				"name": "LIVE_BLOG",
 				"class_name": "LiveBlog"
+			},
+			{
+				"name": "BLOG_CREATION_RATE_LIMITER",
+				"class_name": "BlogCreationRateLimiter"
 			}
 		]
 	},
@@ -64,40 +69,10 @@
 		{
 			"tag": "v1",
 			"new_sqlite_classes": ["LiveBlog"]
-		}
-	],
-
-	/**
-	 * Edge-layer abuse guardrails.
-	 *
-	 * These are deliberately NOT the authoritative limits. Rate Limiting is
-	 * per-Cloudflare-location and eventually consistent, so it is a cheap first
-	 * filter that keeps junk away from the Durable Object. Hard caps (posts per
-	 * blog, connections per blog, body length) are enforced inside the DO against
-	 * SQLite, where they can actually be counted correctly.
-	 *
-	 * `period` must be either 10 or 60.
-	 */
-	"ratelimits": [
-		{
-			// Writes, keyed on the author's capability-token hash — a stable
-			// identifier, which is what the docs recommend over IP addresses.
-			"name": "WRITE_LIMITER",
-			"namespace_id": "2001",
-			"simple": {
-				"limit": 30,
-				"period": 60
-			}
 		},
 		{
-			// Blog creation, keyed on IP. Creation is the one place we have no
-			// stable identifier yet, so IP is the only option available.
-			"name": "CREATE_LIMITER",
-			"namespace_id": "2002",
-			"simple": {
-				"limit": 5,
-				"period": 60
-			}
+			"tag": "v2-temporary-account-rate-limiter",
+			"new_sqlite_classes": ["BlogCreationRateLimiter"]
 		}
 	]
 }

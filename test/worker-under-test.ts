@@ -12,6 +12,7 @@
  * `runInDurableObject` and RPC can reach it directly.
  */
 
+export { BlogCreationRateLimiter } from '../src/durable-objects/BlogCreationRateLimiter';
 export { LiveBlog } from '../src/durable-objects/LiveBlog';
 
 export default {

@@ -18,6 +18,7 @@ export default defineConfig({
 					// `useSQLite` mirrors `new_sqlite_classes` in wrangler.jsonc. Without it
 					// the SQL API is unavailable and every storage call fails.
 					LIVE_BLOG: { className: 'LiveBlog', useSQLite: true },
+					BLOG_CREATION_RATE_LIMITER: { className: 'BlogCreationRateLimiter', useSQLite: true },
 				},
 			},
 		}),

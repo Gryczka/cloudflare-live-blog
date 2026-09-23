@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
 	buildAuthorUrl,
+	hashIdentifier,
 	hashToken,
 	mintToken,
 	readTokenFromFragment,
@@ -46,6 +47,15 @@ describe('hashToken', () => {
 	it('is deterministic and collision-free for distinct inputs', async () => {
 		expect(await hashToken('a')).toBe(await hashToken('a'));
 		expect(await hashToken('a')).not.toBe(await hashToken('b'));
+	});
+});
+
+describe('hashIdentifier', () => {
+	it('provides the same neutral SHA-256 primitive for non-token identifiers', async () => {
+		expect(await hashIdentifier('abc')).toBe(
+			'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+		);
+		expect(await hashIdentifier('identifier')).toBe(await hashIdentifier('identifier'));
 	});
 });
 

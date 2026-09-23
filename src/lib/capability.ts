@@ -39,10 +39,15 @@ export function mintToken(): string {
 	return base64UrlEncode(bytes);
 }
 
-/** SHA-256 of a token, as lowercase hex. This is what gets persisted. */
-export async function hashToken(token: string): Promise<string> {
-	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+/** SHA-256 of a sensitive identifier, as lowercase hex. */
+export async function hashIdentifier(identifier: string): Promise<string> {
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identifier));
 	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** SHA-256 of a token. Kept as the capability-specific name at token call sites. */
+export async function hashToken(token: string): Promise<string> {
+	return hashIdentifier(token);
 }
 
 /**

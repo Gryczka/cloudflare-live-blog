@@ -42,6 +42,18 @@ export const MAX_PINNED_POSTS = 12;
 /** Hard cap on concurrent reader sockets for one blog. */
 export const MAX_CONNECTIONS_PER_BLOG = 1_000;
 
+/** All rate limits reset on Unix-aligned minute boundaries. */
+export const RATE_LIMIT_WINDOW_MS = 60_000;
+
+/** Blog-creation reservations accepted per connecting IP and window. */
+export const MAX_BLOG_CREATIONS_PER_WINDOW = 5;
+
+/** Authorized write reservations accepted per capability token and window. */
+export const MAX_WRITES_PER_TOKEN_PER_WINDOW = 30;
+
+/** Creation-limiter state is cleared after this much inactivity. */
+export const BLOG_CREATION_LIMITER_IDLE_TTL_MS = 10 * 60 * 1000;
+
 /** Posts rendered into the server HTML on first paint, and per history page. */
 export const SNAPSHOT_PAGE_SIZE = 50;
 
@@ -57,6 +69,10 @@ export const BLOG_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** How often the cleanup alarm re-arms itself. */
 export const ALARM_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+export function rateLimitWindowStart(timestamp: number): number {
+	return Math.floor(timestamp / RATE_LIMIT_WINDOW_MS) * RATE_LIMIT_WINDOW_MS;
+}
 
 /** Post kinds. `update` is the default; the rest change presentation only. */
 export const POST_KINDS = ['update', 'headline', 'quote', 'image', 'embed'] as const;

@@ -51,8 +51,10 @@ import {
 	MAX_REPLAY_POSTS,
 	MAX_SUMMARY_LENGTH,
 	MAX_TITLE_LENGTH,
+	MAX_WRITES_PER_TOKEN_PER_WINDOW,
 	SNAPSHOT_PAGE_SIZE,
 	isPostKind,
+	rateLimitWindowStart,
 	type PostKind,
 } from '../lib/limits';
 import {
@@ -151,6 +153,12 @@ export class LiveBlog extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS meta (
 				k TEXT PRIMARY KEY,
 				v TEXT NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS write_rate_limits (
+				capability_hash TEXT PRIMARY KEY,
+				window_start   INTEGER NOT NULL,
+				accepted_writes INTEGER NOT NULL
 			);
 		`);
 	}
@@ -295,6 +303,8 @@ export class LiveBlog extends DurableObject<Env> {
 	async createPost(token: string | null, input: CreatePostInput): Promise<Result<Post>> {
 		const auth = await this.authorize(token);
 		if (!auth.ok) return auth;
+		const reservation = this.reserveWrite(auth.value);
+		if (!reservation.ok) return reservation;
 
 		if (this.readMetaStatus() === 'ended') {
 			return err('This live blog has ended and is no longer accepting posts.', 409);
@@ -306,9 +316,8 @@ export class LiveBlog extends DurableObject<Env> {
 			return err(`Posts must be ${MAX_BODY_LENGTH.toLocaleString()} characters or fewer.`);
 		}
 
-		// Authoritative cap, counted in SQL. The edge rate limiter is a cheap
-		// first filter but is per-location and eventually consistent, so it
-		// cannot enforce a total like this one.
+		// The minute window above bounds bursts; this separate SQL count bounds
+		// the lifetime total for the blog.
 		const total = this.countPosts();
 		if (total >= MAX_POSTS_PER_BLOG) {
 			return err(`This blog has reached its limit of ${MAX_POSTS_PER_BLOG.toLocaleString()} posts.`, 507);
@@ -347,6 +356,8 @@ export class LiveBlog extends DurableObject<Env> {
 	async updatePost(token: string | null, id: string, input: UpdatePostInput): Promise<Result<Post>> {
 		const auth = await this.authorize(token);
 		if (!auth.ok) return auth;
+		const reservation = this.reserveWrite(auth.value);
+		if (!reservation.ok) return reservation;
 
 		const existing = this.sql.exec<PostRow>('SELECT * FROM posts WHERE id = ?', id).toArray()[0];
 		if (!existing) return err('Post not found.', 404);
@@ -416,6 +427,8 @@ export class LiveBlog extends DurableObject<Env> {
 	async deletePost(token: string | null, id: string): Promise<Result<{ id: string }>> {
 		const auth = await this.authorize(token);
 		if (!auth.ok) return auth;
+		const reservation = this.reserveWrite(auth.value);
+		if (!reservation.ok) return reservation;
 
 		const existing = this.sql.exec<PostRow>('SELECT * FROM posts WHERE id = ?', id).toArray()[0];
 		if (!existing) return err('Post not found.', 404);
@@ -440,6 +453,8 @@ export class LiveBlog extends DurableObject<Env> {
 	async updateMeta(token: string | null, input: UpdateMetaInput): Promise<Result<BlogMeta>> {
 		const auth = await this.authorize(token);
 		if (!auth.ok) return auth;
+		const reservation = this.reserveWrite(auth.value);
+		if (!reservation.ok) return reservation;
 
 		const updates: Record<string, string> = {};
 		if (input.title !== undefined) {
@@ -464,6 +479,8 @@ export class LiveBlog extends DurableObject<Env> {
 	async setStatus(token: string | null, status: BlogStatus): Promise<Result<BlogMeta>> {
 		const auth = await this.authorize(token);
 		if (!auth.ok) return auth;
+		const reservation = this.reserveWrite(auth.value);
+		if (!reservation.ok) return reservation;
 
 		const now = Date.now();
 		this.setMetaValues({
@@ -609,11 +626,40 @@ export class LiveBlog extends DurableObject<Env> {
 	/*                                Internals                               */
 	/* ---------------------------------------------------------------------- */
 
-	private async authorize(token: string | null): Promise<Result<true>> {
+	private async authorize(token: string | null): Promise<Result<string>> {
 		if (!this.isInitialized()) return err('Live blog not found.', 404);
 		const storedHash = this.getMetaValue('edit_token_hash');
-		if (await verifyToken(token, storedHash)) return ok(true);
+		if (storedHash && (await verifyToken(token, storedHash))) return ok(storedHash);
 		return err('A valid author link is required to publish to this live blog.', 403);
+	}
+
+	/** Atomically reserve one authorized write in the current Unix minute. */
+	private reserveWrite(capabilityHash: string): Result<true> {
+		const windowStart = rateLimitWindowStart(Date.now());
+		const reservation = this.sql
+			.exec<{ accepted_writes: number }>(
+				`INSERT INTO write_rate_limits (capability_hash, window_start, accepted_writes)
+				 VALUES (?, ?, 1)
+				 ON CONFLICT(capability_hash) DO UPDATE SET
+				   window_start = excluded.window_start,
+				   accepted_writes = CASE
+				     WHEN write_rate_limits.window_start = excluded.window_start
+				       THEN write_rate_limits.accepted_writes + 1
+				     ELSE 1
+				   END
+				 WHERE write_rate_limits.window_start != excluded.window_start
+				    OR write_rate_limits.accepted_writes < ?
+				 RETURNING accepted_writes`,
+				capabilityHash,
+				windowStart,
+				MAX_WRITES_PER_TOKEN_PER_WINDOW,
+			)
+			.toArray()[0];
+
+		if (!reservation) {
+			return err('You are publishing too quickly. Give it a few seconds and try again.', 429);
+		}
+		return ok(true);
 	}
 
 	/**

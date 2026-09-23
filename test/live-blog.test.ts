@@ -9,10 +9,14 @@
 
 import { runInDurableObject } from 'cloudflare:test';
 import { env } from 'cloudflare:workers';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { LiveBlog } from '../src/durable-objects/LiveBlog';
-import { MAX_PINNED_POSTS } from '../src/lib/limits';
+import {
+	MAX_PINNED_POSTS,
+	MAX_WRITES_PER_TOKEN_PER_WINDOW,
+	RATE_LIMIT_WINDOW_MS,
+} from '../src/lib/limits';
 
 type Stub = DurableObjectStub<LiveBlog>;
 
@@ -50,11 +54,14 @@ describe('createBlog', () => {
 
 	it('never persists the raw token', async () => {
 		const name = `blog-${crypto.randomUUID()}`;
-		const { token } = await newBlog(name);
+		const { stub, token } = await newBlog(name);
+		await stub.createPost(token, { body: 'counted write' });
 
 		await runInDurableObject(stubFor(name), (_instance, state) => {
-			const rows = state.storage.sql.exec('SELECT k, v FROM meta').toArray();
-			const serialized = JSON.stringify(rows);
+			const serialized = JSON.stringify({
+				meta: state.storage.sql.exec('SELECT k, v FROM meta').toArray(),
+				writeRateLimits: state.storage.sql.exec('SELECT * FROM write_rate_limits').toArray(),
+			});
 			// Only the digest is stored, so a storage dump does not grant write access.
 			expect(serialized).not.toContain(token);
 			expect(serialized).toContain('edit_token_hash');
@@ -113,6 +120,81 @@ describe('authorization', () => {
 
 		// Nothing changed.
 		expect(unwrap(await stub.getPost(post.id)).body).toBe('original');
+	});
+});
+
+describe('write rate limiting', () => {
+	it('allows 30 authorized writes, blocks the next, and resets exactly at the next Unix minute', async () => {
+		const boundary = RATE_LIMIT_WINDOW_MS * 30_000;
+		const now = vi.spyOn(Date, 'now').mockReturnValue(boundary - 1);
+
+		try {
+			const { stub, token } = await newBlog();
+			for (let i = 0; i < MAX_WRITES_PER_TOKEN_PER_WINDOW; i++) {
+				expect((await stub.createPost(token, { body: `post ${i}` })).ok).toBe(true);
+			}
+
+			const blocked = await stub.createPost(token, { body: 'one too many' });
+			expect(blocked.ok).toBe(false);
+			if (!blocked.ok) {
+				expect(blocked.status).toBe(429);
+				expect(blocked.error).toBe('You are publishing too quickly. Give it a few seconds and try again.');
+			}
+
+			now.mockReturnValue(boundary);
+			expect((await stub.createPost(token, { body: 'first in the next window' })).ok).toBe(true);
+		} finally {
+			now.mockRestore();
+		}
+	});
+
+	it('serializes concurrent writes without overrunning the limit', async () => {
+		const now = vi.spyOn(Date, 'now').mockReturnValue(RATE_LIMIT_WINDOW_MS * 40_000 + 1);
+
+		try {
+			const { stub, token } = await newBlog();
+			const results = await Promise.all(
+				Array.from({ length: MAX_WRITES_PER_TOKEN_PER_WINDOW + 5 }, (_, i) =>
+					stub.createPost(token, { body: `concurrent ${i}` }),
+				),
+			);
+
+			expect(results.filter((result) => result.ok)).toHaveLength(MAX_WRITES_PER_TOKEN_PER_WINDOW);
+			const blocked = results.filter((result) => !result.ok);
+			expect(blocked).toHaveLength(5);
+			expect(blocked.every((result) => !result.ok && result.status === 429)).toBe(true);
+			expect(unwrap(await stub.getMeta()).postCount).toBe(MAX_WRITES_PER_TOKEN_PER_WINDOW);
+		} finally {
+			now.mockRestore();
+		}
+	});
+
+	it('validates capabilities before creating a counter', async () => {
+		const name = `blog-${crypto.randomUUID()}`;
+		const { stub, token } = await newBlog(name);
+
+		const rejected = await stub.createPost('not-the-token', { body: 'nope' });
+		expect(rejected.ok).toBe(false);
+		if (!rejected.ok) expect(rejected.status).toBe(403);
+
+		await runInDurableObject(stubFor(name), (_instance, state) => {
+			const count = state.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM write_rate_limits').one().n;
+			expect(count).toBe(0);
+		});
+
+		expect((await stub.createPost(token, { body: 'authorized' })).ok).toBe(true);
+	});
+
+	it('fails closed when write-counter storage fails', async () => {
+		const name = `blog-${crypto.randomUUID()}`;
+		const { stub, token } = await newBlog(name);
+
+		await runInDurableObject(stubFor(name), async (instance, state) => {
+			state.storage.sql.exec('DROP TABLE write_rate_limits');
+			await expect(instance.createPost(token, { body: 'must not publish' })).rejects.toThrow();
+			const count = state.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM posts').one().n;
+			expect(count).toBe(0);
+		});
 	});
 });
 

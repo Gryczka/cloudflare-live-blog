@@ -1,6 +1,22 @@
 # Live Blog
 
+> [!IMPORTANT]
+> **Temporary-account compatibility variant.** This branch replaces the native
+> Workers Rate Limiting bindings with SQLite Durable Object counters because they
+> are not supported by Wrangler temporary accounts. Run `npm run temporary:deploy`
+> only while Wrangler is unauthenticated; existing OAuth, API-token, or global API-key
+> credentials cause `--temporary` to exit with an error. Complete
+> the [claim flow](https://developers.cloudflare.com/workers/platform/claim-deployments/)
+> within **60 minutes**; merely opening the claim URL is not enough. If it is not
+> claimed in time, Cloudflare deletes the temporary account and all of its deployments
+> and resources. Treat the claim URL as a bearer credential and do not log or share
+> it. The `main` branch remains the full, default variant with native Workers Rate
+> Limiting bindings.
+
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Gryczka/cloudflare-live-blog)
+
+The generic deploy button uses the repository's default `main` branch, not this
+temporary-account compatibility branch.
 
 A newsroom-style live blog on Cloudflare Workers. One SQLite-backed Durable Object
 per blog orders every update, fans it out over hibernatable WebSockets, and serves
@@ -65,11 +81,16 @@ flowchart TB
     subgraph Worker["Cloudflare Worker (src/worker.ts)"]
         Route["/api/blogs/* router"]
         Astro["Astro SSR handler"]
-        RL["Rate Limiting bindings"]
+        Hash["SHA-256 identifier routing"]
+    end
+
+    subgraph CreateDO["BlogCreationRateLimiter DO — one per IP digest"]
+        CreateRL["5 reservations / Unix minute"]
     end
 
     subgraph DO["LiveBlog Durable Object — one per blog"]
         Auth["capability check<br/><i>SHA-256 digest</i>"]
+        WriteRL["30 writes / token / Unix minute"]
         Seq["monotonic seq"]
         SQL[("SQLite<br/>posts + meta")]
         WS["hibernatable sockets"]
@@ -80,7 +101,8 @@ flowchart TB
     Astro -- "RPC getSnapshot()" --> SQL
     Reader <-. "WSS ?since=seq" .-> WS
     Author -- "writes + X-Edit-Token" --> Route
-    Route --> RL --> Auth --> Seq --> SQL
+    Route -- "create + CF-Connecting-IP" --> Hash --> CreateRL
+    Route --> Auth --> WriteRL --> Seq --> SQL
     SQL --> WS
     WS -. "post.created / updated / deleted" .-> Reader
 ```
@@ -167,10 +189,21 @@ constant-time digest comparison.
 
 Public demos get abused, and the two mechanisms here are not interchangeable:
 
-**Rate Limiting bindings** at the Worker edge reject junk cheaply. Writes are keyed
-on the token's digest rather than an IP — a token identifies one author, whereas an
-IP can be a whole office. This layer is per-Cloudflare-location and eventually
-consistent, so it cannot enforce a total.
+**SQLite fixed-window counters** provide the rate limits in this temporary-account
+variant. Blog creation uses one deterministic `BlogCreationRateLimiter` object per
+full SHA-256 digest of the platform-provided `CF-Connecting-IP`; the raw IP is never
+stored. Writes are counted in the existing `LiveBlog` object by full capability-token
+digest, after capability validation. Both counters reset on Unix-aligned 60-second
+boundaries, and serialization prevents concurrent requests from overrunning them.
+Creation-limiter storage is deleted ten minutes after the latest reservation attempt;
+the Durable Object identity remains and safely recreates its schema if used again.
+Missing connecting-IP data or unavailable limiter storage fails closed with a 503,
+while an exhausted counter returns 429.
+
+An IP is abuse-control context, not user identity. People behind the same NAT share a
+creation budget, while a caller who changes IP addresses gets a separate budget. The
+native Rate Limiting binding on `main` is preferable for permanent deployments; this
+SQLite design exists so the complete demo can run in a temporary account.
 
 **SQL counts** inside the Durable Object are authoritative for anything that is a
 total: posts per blog, pinned events, live connections.
@@ -186,8 +219,9 @@ storage forever.
 | Posts per blog | 5,000 | DO (`COUNT`) |
 | Pinned key events | 12 | DO (`COUNT`) |
 | Concurrent readers per blog | 1,000 | DO (`getWebSockets()`) |
-| Writes | 30 / min / token | Rate Limiting binding |
-| Blog creation | 5 / min / IP | Rate Limiting binding |
+| Writes | 30 / Unix minute / token | `LiveBlog` SQLite counter |
+| Blog creation | 5 / Unix minute / IP | `BlogCreationRateLimiter` SQLite counter |
+| Creation counter retention | 10 minutes after activity | DO alarm |
 | Idle blog retention | 30 days | DO alarm |
 
 These numbers are internally consistent, which is worth stating because the previous
@@ -244,28 +278,37 @@ with a code comment explaining that its dev server required them.
 
 ## Getting started
 
+Node.js 22 or newer is required.
+
 ```bash
 npm install
 npm run dev          # http://localhost:4321
 ```
 
 `astro dev` runs your server code in `workerd` via the Cloudflare Vite plugin, so the
-Durable Object, SQLite, WebSockets, and Rate Limiting bindings are all real locally.
+Durable Objects, SQLite counters, and WebSockets are all real locally.
 There is no mock API. This is worth calling out because the previous version had two
 implementations of its API — a real one and a set of dev-mode stubs that returned
 fabricated data and refused WebSocket upgrades — so `npm run dev` ran a different,
 non-functional application.
 
 ```bash
-npm test             # 83 tests in workerd via vitest-pool-workers
+npm test             # tests in workerd via vitest-pool-workers
 npm run check        # astro check + tsc for the test project
 npm run preview      # production build under wrangler dev
 npm run budget       # reader JS budget check
 npm run deploy       # astro build && wrangler deploy
+npm run temporary:deploy # build/check gate + local wrangler deploy --temporary
 ```
 
-Deploying provisions nothing beyond the Worker itself: the Durable Object namespace
-and both Rate Limiting bindings come from `wrangler.jsonc`.
+The temporary command creates or reuses an unauthenticated preview account and prints
+its claim URL. It supports unauthenticated use only: existing OAuth, API-token, or
+global API-key credentials cause an error rather than deploying through your active
+account. Use `npm run deploy` for an authenticated deployment. See [Claim deployments
+(temporary accounts)](https://developers.cloudflare.com/workers/platform/claim-deployments/)
+for the lifecycle and security requirements. Both SQLite Durable Object namespaces
+are declared in `wrangler.jsonc`; no native Rate Limiting bindings are present on this
+branch.
 
 ## Project layout
 
@@ -275,6 +318,8 @@ src/
                              security headers, then hands off to Astro
   durable-objects/
     LiveBlog.ts              SQLite schema, RPC surface, sockets, alarm
+    BlogCreationRateLimiter.ts
+                             per-IP-digest creation reservations
   lib/
     protocol.ts              wire types shared by server, pages, and islands
     limits.ts                every limit, imported by both sides
@@ -283,7 +328,11 @@ src/
     escape.ts                split out so the reader island skips the renderer
     render-post.ts           post markup, used by SSR *and* the island
     blog-id.ts               route-parameter validation
+    server/api-response.ts   framework-independent JSON request/response helpers
     server/blog.ts           typed DO stub for Astro pages
+    server/blog-creation-rate-limit.ts
+                              fail-closed creation limiter routing
+    server/create-blog.ts    testable POST /api/blogs implementation
   islands/
     live-feed.ts             the reader island (plain TypeScript)
     create-blog.ts           landing page
