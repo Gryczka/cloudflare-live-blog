@@ -37,11 +37,11 @@
  */
 
 import { DurableObject } from 'cloudflare:workers';
+import { configuredLimit } from './BlogDirectory';
 
 import { hashToken, mintToken, verifyToken } from '../lib/capability';
 import { renderMarkdown } from '../lib/markdown';
 import {
-	ALARM_INTERVAL_MS,
 	BLOG_TTL_MS,
 	MAX_AUTHOR_LENGTH,
 	MAX_BODY_LENGTH,
@@ -98,13 +98,19 @@ interface ConnectionState {
 	joinedAt: number;
 }
 
+/** Migration reads only public identity/status and the existing expiry deadline. */
+export interface PublicBlogMetadata {
+	blogId: string;
+	status: BlogStatus;
+	expiresAt: number;
+}
+
 export class LiveBlog extends DurableObject<Env> {
 	private readonly sql: SqlStorage;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.sql = ctx.storage.sql;
-		this.ensureSchema();
 
 		/**
 		 * Let the runtime answer keep-alive pings without waking this object.
@@ -119,11 +125,8 @@ export class LiveBlog extends DurableObject<Env> {
 	/**
 	 * Create the schema if it is absent.
 	 *
-	 * Called from the constructor and again after `deleteAll()`. That second call
-	 * matters: `deleteAll()` drops the tables, but it does not evict the in-memory
-	 * instance, so without re-creating them every subsequent query on this instance
-	 * would fail with "no such table" — turning what should be a clean 404 into a
-	 * 500 until the object happened to be evicted.
+	 * Called only by admitted creation. Unknown or expired reads check for the
+	 * meta table and return 404 without allocating or re-creating schema.
 	 *
 	 * Synchronous and idempotent, so it needs no `blockConcurrencyWhile`.
 	 */
@@ -171,13 +174,16 @@ export class LiveBlog extends DurableObject<Env> {
 		title?: string;
 		summary?: string;
 	}): Promise<Result<CreateBlogResult>> {
-		if (this.isInitialized()) {
+		if (this.getMetaValue('blog_id') !== null) {
 			return err('That blog id is already taken.', 409);
 		}
 
 		const editToken = mintToken();
 		const tokenHash = await hashToken(editToken);
 		const now = Date.now();
+		// Schema allocation happens only on admitted creation, never on a read.
+		this.ensureSchema();
+		if (this.getMetaValue('blog_id') !== null) return err('That blog id is already taken.', 409);
 
 		const title = normalizeText(input.title, MAX_TITLE_LENGTH) || 'Untitled live blog';
 		const summary = normalizeText(input.summary, MAX_SUMMARY_LENGTH) ?? '';
@@ -188,6 +194,7 @@ export class LiveBlog extends DurableObject<Env> {
 			summary,
 			status: 'live',
 			created_at: String(now),
+			lifetime_policy: 'absolute-v1',
 			updated_at: String(now),
 			last_write_at: String(now),
 			edit_token_hash: tokenHash,
@@ -201,7 +208,25 @@ export class LiveBlog extends DurableObject<Env> {
 
 	/** Whether this blog exists. Reads never auto-create one. */
 	isInitialized(): boolean {
-		return this.getMetaValue('blog_id') !== null;
+		return this.getPublicMetadata().ok;
+	}
+
+	getPublicMetadata(): Result<PublicBlogMetadata> {
+		const blogId = this.getMetaValue('blog_id');
+		if (!blogId || !this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'posts'").toArray().length) return err('Live blog not found.', 404);
+		const expiresAt = this.expiryDeadline();
+		if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return err('Live blog expired.', 410);
+		return ok({ blogId, status: this.readMetaStatus(), expiresAt });
+	}
+
+	private expiryDeadline(): number {
+		const lastWrite = Number(this.getMetaValue('last_write_at'));
+		if (!Number.isFinite(lastWrite) || lastWrite <= 0) return NaN;
+		const idleDeadline = lastWrite + BLOG_TTL_MS;
+		// Deployed actors have no marker: retain their sliding inactivity policy.
+		return this.getMetaValue('lifetime_policy') === 'absolute-v1'
+			? Math.min(idleDeadline, Number(this.getMetaValue('created_at')) + BLOG_TTL_MS)
+			: idleDeadline;
 	}
 
 	/* ---------------------------------------------------------------------- */
@@ -295,6 +320,8 @@ export class LiveBlog extends DurableObject<Env> {
 	async createPost(token: string | null, input: CreatePostInput): Promise<Result<Post>> {
 		const auth = await this.authorize(token);
 		if (!auth.ok) return auth;
+		const live = this.getPublicMetadata();
+		if (!live.ok) return live;
 
 		if (this.readMetaStatus() === 'ended') {
 			return err('This live blog has ended and is no longer accepting posts.', 409);
@@ -309,8 +336,9 @@ export class LiveBlog extends DurableObject<Env> {
 		// Authoritative cap, counted in SQL. The edge rate limiter is a cheap
 		// first filter but is per-location and eventually consistent, so it
 		// cannot enforce a total like this one.
-		const total = this.countPosts();
-		if (total >= MAX_POSTS_PER_BLOG) {
+		const total = this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM posts').one().n;
+		const maximum = configuredLimit(this.env.MAX_RETAINED_POSTS, MAX_POSTS_PER_BLOG, MAX_POSTS_PER_BLOG);
+		if (total >= maximum) {
 			return err(`This blog has reached its limit of ${MAX_POSTS_PER_BLOG.toLocaleString()} posts.`, 507);
 		}
 
@@ -320,9 +348,13 @@ export class LiveBlog extends DurableObject<Env> {
 			return err(`You can pin at most ${MAX_PINNED_POSTS} key events.`);
 		}
 
+		const id = crypto.randomUUID();
+		const html = renderMarkdown(body);
+		const writable = this.getPublicMetadata();
+		if (!writable.ok) return writable;
+		// No await between this lifetime check and any sequence/content/meta write.
 		const now = Date.now();
 		const seq = this.nextSeq();
-		const id = crypto.randomUUID();
 
 		this.sql.exec(
 			`INSERT INTO posts (id, seq, kind, body, html, author, pinned, revision, created_at)
@@ -331,7 +363,7 @@ export class LiveBlog extends DurableObject<Env> {
 			seq,
 			kind,
 			body,
-			renderMarkdown(body),
+			html,
 			normalizeText(input.author, MAX_AUTHOR_LENGTH),
 			pinned ? 1 : 0,
 			now,
@@ -347,6 +379,8 @@ export class LiveBlog extends DurableObject<Env> {
 	async updatePost(token: string | null, id: string, input: UpdatePostInput): Promise<Result<Post>> {
 		const auth = await this.authorize(token);
 		if (!auth.ok) return auth;
+		const live = this.getPublicMetadata();
+		if (!live.ok) return live;
 
 		const existing = this.sql.exec<PostRow>('SELECT * FROM posts WHERE id = ?', id).toArray()[0];
 		if (!existing) return err('Post not found.', 404);
@@ -376,12 +410,14 @@ export class LiveBlog extends DurableObject<Env> {
 			(pinned ? 1 : 0) === existing.pinned;
 		if (unchanged) return ok(toPost(existing));
 
-		const now = Date.now();
-		const seq = this.nextSeq();
-
 		// `revision` only advances when the text actually changed. Pinning or
 		// re-labelling a post is not a correction to the reader.
 		const revision = body === existing.body ? existing.revision : existing.revision + 1;
+		const html = renderMarkdown(body);
+		const writable = this.getPublicMetadata();
+		if (!writable.ok) return writable;
+		const now = Date.now();
+		const seq = this.nextSeq();
 
 		this.sql.exec(
 			`UPDATE posts
@@ -390,7 +426,7 @@ export class LiveBlog extends DurableObject<Env> {
 			seq,
 			kind,
 			body,
-			renderMarkdown(body),
+			html,
 			author,
 			pinned ? 1 : 0,
 			revision,
@@ -416,16 +452,20 @@ export class LiveBlog extends DurableObject<Env> {
 	async deletePost(token: string | null, id: string): Promise<Result<{ id: string }>> {
 		const auth = await this.authorize(token);
 		if (!auth.ok) return auth;
+		const live = this.getPublicMetadata();
+		if (!live.ok) return live;
 
 		const existing = this.sql.exec<PostRow>('SELECT * FROM posts WHERE id = ?', id).toArray()[0];
 		if (!existing) return err('Post not found.', 404);
 		if (existing.deleted_at !== null) return ok({ id });
 
+		const writable = this.getPublicMetadata();
+		if (!writable.ok) return writable;
 		const now = Date.now();
 		const seq = this.nextSeq();
 
 		this.sql.exec(
-			`UPDATE posts SET seq = ?, deleted_at = ?, pinned = 0, html = '', updated_at = ? WHERE id = ?`,
+			`UPDATE posts SET seq = ?, deleted_at = ?, pinned = 0, body = '', html = '', updated_at = ? WHERE id = ?`,
 			seq,
 			now,
 			now,
@@ -440,6 +480,8 @@ export class LiveBlog extends DurableObject<Env> {
 	async updateMeta(token: string | null, input: UpdateMetaInput): Promise<Result<BlogMeta>> {
 		const auth = await this.authorize(token);
 		if (!auth.ok) return auth;
+		const live = this.getPublicMetadata();
+		if (!live.ok) return live;
 
 		const updates: Record<string, string> = {};
 		if (input.title !== undefined) {
@@ -452,6 +494,8 @@ export class LiveBlog extends DurableObject<Env> {
 		}
 		if (Object.keys(updates).length === 0) return ok(this.readMeta());
 
+		const writable = this.getPublicMetadata();
+		if (!writable.ok) return writable;
 		const now = Date.now();
 		this.setMetaValues({ ...updates, updated_at: String(now), last_write_at: String(now) });
 
@@ -465,6 +509,8 @@ export class LiveBlog extends DurableObject<Env> {
 		const auth = await this.authorize(token);
 		if (!auth.ok) return auth;
 
+		const writable = this.getPublicMetadata();
+		if (!writable.ok) return writable;
 		const now = Date.now();
 		this.setMetaValues({
 			status,
@@ -475,13 +521,14 @@ export class LiveBlog extends DurableObject<Env> {
 
 		const meta = this.readMeta();
 		this.broadcast({ t: 'meta.updated', meta });
+		if (status === 'ended') this.closeReaders('Coverage ended');
 		return ok(meta);
 	}
 
 	/** Verify a capability token without performing a write. */
 	async checkToken(token: string | null): Promise<boolean> {
 		const auth = await this.authorize(token);
-		return auth.ok;
+		return auth.ok && this.isInitialized();
 	}
 
 	/* ---------------------------------------------------------------------- */
@@ -505,9 +552,11 @@ export class LiveBlog extends DurableObject<Env> {
 		if (!this.isInitialized()) {
 			return new Response('Live blog not found.', { status: 404 });
 		}
+		if (request.headers.get('Origin') !== url.origin) return new Response('Origin denied.', { status: 403 });
+		if (this.readMetaStatus() === 'ended') return new Response('Coverage ended; use the archive.', { status: 409 });
 
 		// Authoritative connection cap; `getWebSockets()` is the real count.
-		if (this.readerCount() >= MAX_CONNECTIONS_PER_BLOG) {
+		if (this.readerCount() >= configuredLimit(this.env.MAX_BLOG_SOCKETS, 100, MAX_CONNECTIONS_PER_BLOG)) {
 			return new Response('This live blog has reached its viewer limit.', { status: 503 });
 		}
 
@@ -549,8 +598,10 @@ export class LiveBlog extends DurableObject<Env> {
 	 * constructor — the runtime answers pings without waking this object, which is
 	 * the whole point of hibernation.
 	 */
-	override async webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer): Promise<void> {
-		// Intentionally empty. Kept explicit so the hibernation contract is visible.
+	override async webSocketMessage(ws: WebSocket, _message: string | ArrayBuffer): Promise<void> {
+		// Only the runtime's literal ping auto-response is supported. Other frames
+		// cannot turn a read-only feed into an unbounded wake-up/message workload.
+		ws.close(1008, 'Read-only feed');
 	}
 
 	override async webSocketClose(_ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
@@ -576,10 +627,12 @@ export class LiveBlog extends DurableObject<Env> {
 	 * persists forever and bills for storage forever.
 	 */
 	override async alarm(): Promise<void> {
+		if (!this.sql.exec("SELECT name FROM sqlite_master WHERE name = 'meta'").toArray().length) return;
 		const lastWrite = Number.parseInt(this.getMetaValue('last_write_at') ?? '0', 10);
 		const idleFor = Date.now() - lastWrite;
 
-		if (lastWrite > 0 && idleFor > BLOG_TTL_MS) {
+		const deadline = this.expiryDeadline();
+		if (!Number.isFinite(deadline) || Date.now() >= deadline) {
 			console.log(
 				JSON.stringify({
 					event: 'blog_expired',
@@ -588,20 +641,17 @@ export class LiveBlog extends DurableObject<Env> {
 				}),
 			);
 			// Also clears the alarm, so this object goes quiet permanently.
+			this.closeReaders('Blog expired');
 			await this.ctx.storage.deleteAll();
-			// Leave this instance queryable: deleteAll() drops the tables but does not
-			// evict us, so reads arriving before eviction must see an empty blog rather
-			// than a SQL error.
-			this.ensureSchema();
 			return;
 		}
 
-		await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+		await this.ctx.storage.setAlarm(deadline);
 	}
 
 	private async ensureAlarm(): Promise<void> {
 		if ((await this.ctx.storage.getAlarm()) === null) {
-			await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+			await this.ctx.storage.setAlarm(this.expiryDeadline());
 		}
 	}
 
@@ -610,17 +660,22 @@ export class LiveBlog extends DurableObject<Env> {
 	/* ---------------------------------------------------------------------- */
 
 	private async authorize(token: string | null): Promise<Result<true>> {
-		if (!this.isInitialized()) return err('Live blog not found.', 404);
+		const live = this.getPublicMetadata();
+		if (!live.ok) return live;
 		const storedHash = this.getMetaValue('edit_token_hash');
-		if (await verifyToken(token, storedHash)) return ok(true);
+		const verified = await verifyToken(token, storedHash);
+		// Hashing opens an async boundary: expiry/cleanup may have happened while
+		// it was pending. Never renew a terminal legacy actor or query cleared tables.
+		const current = this.getPublicMetadata();
+		if (!current.ok) return current;
+		if (verified && storedHash === this.getMetaValue('edit_token_hash')) return ok(true);
 		return err('A valid author link is required to publish to this live blog.', 403);
 	}
 
 	/**
 	 * Allocate the next mutation sequence.
 	 *
-	 * Safe as a read-then-write because a Durable Object processes one request at
-	 * a time — there is no concurrent caller to race with.
+	 * This read/modify/write has no await, so another event cannot interleave.
 	 */
 	private nextSeq(): number {
 		const next = Number.parseInt(this.getMetaValue('seq_counter') ?? '0', 10) + 1;
@@ -637,7 +692,10 @@ export class LiveBlog extends DurableObject<Env> {
 	}
 
 	private readerCount(): number {
-		return this.ctx.getWebSockets().length;
+		return this.ctx.getWebSockets().filter(ws => ws.readyState === WebSocket.OPEN).length;
+	}
+	private closeReaders(reason: string): void {
+		for (const ws of this.ctx.getWebSockets()) if (ws.readyState === WebSocket.OPEN) ws.close(1001, reason);
 	}
 
 	private countPosts(): number {
@@ -679,6 +737,7 @@ export class LiveBlog extends DurableObject<Env> {
 	}
 
 	private getMetaValue(key: string): string | null {
+		if (!this.sql.exec("SELECT name FROM sqlite_master WHERE name = 'meta'").toArray().length) return null;
 		const row = this.sql.exec<{ v: string }>('SELECT v FROM meta WHERE k = ?', key).toArray()[0];
 		return row ? row.v : null;
 	}

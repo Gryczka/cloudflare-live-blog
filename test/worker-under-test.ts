@@ -13,6 +13,7 @@
  */
 
 export { LiveBlog } from '../src/durable-objects/LiveBlog';
+export { BlogDirectory } from '../src/durable-objects/BlogDirectory';
 
 export default {
 	async fetch(): Promise<Response> {

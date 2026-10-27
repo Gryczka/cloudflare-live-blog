@@ -1,10 +1,12 @@
 # Live Blog
 
+See [current guardrails, budgets and the required existing-blog migration](docs/app-garden-guardrails.md) before deploying.
+
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Gryczka/cloudflare-live-blog)
 
 A newsroom-style live blog on Cloudflare Workers. One SQLite-backed Durable Object
 per blog orders every update, fans it out over hibernatable WebSockets, and serves
-the feed as server-rendered HTML — so the reader downloads **19.7 KB of JavaScript**
+the feed as server-rendered HTML — so the reader downloads **20.0 KB of JavaScript**
 and sees the content in the first HTML byte.
 
 **[Live demo →](https://cloudflare-live-blog.dwarven.workers.dev)**
@@ -257,15 +259,18 @@ fabricated data and refused WebSocket upgrades — so `npm run dev` ran a differ
 non-functional application.
 
 ```bash
-npm test             # 83 tests in workerd via vitest-pool-workers
+npm test             # 115 tests in workerd via vitest-pool-workers
 npm run check        # astro check + tsc for the test project
 npm run preview      # production build under wrangler dev
 npm run budget       # reader JS budget check
 npm run deploy       # astro build && wrangler deploy
 ```
 
-Deploying provisions nothing beyond the Worker itself: the Durable Object namespace
-and both Rate Limiting bindings come from `wrangler.jsonc`.
+Deploying provisions nothing beyond the Worker itself: both Durable Object namespaces
+and both Rate Limiting bindings come from `wrangler.jsonc`. A fresh deployment starts
+with empty legacy inventories. The hosted garden builds with
+`GARDEN_PRODUCTION_PREFLIGHT=1`, which selects an untracked owner config containing
+its account and verified legacy blog inventory.
 
 ## Project layout
 

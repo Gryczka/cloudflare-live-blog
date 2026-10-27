@@ -25,8 +25,9 @@ let exists = false;
 let title = 'Author console';
 
 if (validation.valid) {
-	const result = await getBlogStub(validation.blogId).getMeta();
-	if (result.ok) {
+	const stub = await getBlogStub(validation.blogId);
+	const result = await stub?.getMeta();
+	if (result?.ok) {
 		exists = true;
 		title = result.value.title;
 	}

@@ -1,6 +1,10 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "cloudflare-live-blog",
+	// Legacy inventories admit pre-directory blogs. A fresh deployment has none;
+	// the hosted garden supplies its verified inventory from an untracked
+	// wrangler.production-preflight.jsonc (GARDEN_PRODUCTION_PREFLIGHT=1).
+	"vars": { "LEGACY_BLOG_OBJECT_IDS": "[]", "LEGACY_BLOG_IDS": "[]", "NEW_BLOGS_PER_HOUR": "5", "MAX_ACTIVE_BLOGS": "50", "MAX_RETAINED_POSTS": "5000", "MAX_BLOG_SOCKETS": "100" },
 
 	/**
 	 * Custom Worker entrypoint.
@@ -47,6 +51,10 @@
 			{
 				"name": "LIVE_BLOG",
 				"class_name": "LiveBlog"
+			},
+			{
+				"name": "BLOG_DIRECTORY",
+				"class_name": "BlogDirectory"
 			}
 		]
 	},
@@ -64,7 +72,8 @@
 		{
 			"tag": "v1",
 			"new_sqlite_classes": ["LiveBlog"]
-		}
+		},
+		{ "tag": "v2-directory", "new_sqlite_classes": ["BlogDirectory"] }
 	],
 
 	/**

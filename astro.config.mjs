@@ -4,6 +4,7 @@ import cloudflare from '@astrojs/cloudflare';
 import preact from '@astrojs/preact';
 
 export default defineConfig({
+	site: 'https://cloudflare-live-blog.dwarven.workers.dev',
 	/**
 	 * Every route is rendered on demand. The reader page needs the current feed in
 	 * its first HTML byte (see src/pages/blog/[blogId]/index.astro), so there is
@@ -12,6 +13,13 @@ export default defineConfig({
 	output: 'server',
 
 	adapter: cloudflare({
+		/**
+		 * The hosted garden builds from an untracked owner config that carries its
+		 * account and verified legacy inventory. Everyone else uses wrangler.jsonc.
+		 */
+		...(process.env.GARDEN_PRODUCTION_PREFLIGHT === '1'
+			? { configPath: './wrangler.production-preflight.jsonc' }
+			: {}),
 		/**
 		 * No remote image transformation. This project renders text, and the only
 		 * image is a static SVG favicon, so there is no reason to configure an

@@ -22,11 +22,12 @@ import { handle } from '@astrojs/cloudflare/handler';
 import { LiveBlog } from './durable-objects/LiveBlog';
 import { EDIT_TOKEN_HEADER, hashToken } from './lib/capability';
 import { generateBlogId, isValidBlogId, slugify, validateBlogId } from './lib/blog-id';
-import { blogStub } from './lib/server/blog';
+import { blogStub, directory, resolveBlogStub } from './lib/server/blog';
 import { SNAPSHOT_PAGE_SIZE } from './lib/limits';
 import type { Result } from './lib/protocol';
 
 export { LiveBlog };
+export { BlogDirectory } from './durable-objects/BlogDirectory';
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -79,13 +80,24 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 	const validation = validateBlogId(blogId);
 	if (!validation.valid) return json({ error: validation.error }, 400);
 
-	const stub = blogStub(env, validation.blogId);
+	const stub = await resolveBlogStub(env, validation.blogId);
+	if (!stub) return json({ error: 'Live blog not found.' }, 404);
 	const rest = segments.slice(3);
 	const token = request.headers.get(EDIT_TOKEN_HEADER);
+	const unwrapWrite = async <T>(result: Result<T>): Promise<Response> => {
+		// Legacy writes extend their original inactivity window, including the
+		// directory/sitemap deadline. They never acquire the new absolute policy.
+		if (result.ok && (await directory(env).lookup(validation.blogId))?.legacy) {
+			const metadata = await stub.getPublicMetadata();
+			if (metadata.ok) await directory(env).registerLegacy(validation.blogId, metadata.value);
+		}
+		return unwrap(result);
+	};
 
 	// GET /api/blogs/:id/socket — WebSocket upgrade (must be a fetch, not RPC)
 	if (rest.length === 1 && rest[0] === 'socket') {
 		if (method !== 'GET') return methodNotAllowed('GET');
+		if (request.headers.get('Origin') !== url.origin) return json({ error: 'Origin denied.' }, 403);
 		return stub.fetch(request);
 	}
 
@@ -110,7 +122,7 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 		if (!(await allowWrite(env, token))) return rateLimited();
 		const body = await readJson<{ title?: string; summary?: string }>(request);
 		if (!body.ok) return json({ error: body.error }, 400);
-		return unwrap(await stub.updateMeta(token, body.value));
+		return unwrapWrite(await stub.updateMeta(token, body.value));
 	}
 
 	// PUT /api/blogs/:id/status
@@ -123,7 +135,7 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 		if (status !== 'live' && status !== 'ended') {
 			return json({ error: 'Status must be "live" or "ended".' }, 400);
 		}
-		return unwrap(await stub.setStatus(token, status));
+		return unwrapWrite(await stub.setStatus(token, status));
 	}
 
 	// POST /api/blogs/:id/posts
@@ -132,7 +144,7 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 		if (!(await allowWrite(env, token))) return rateLimited();
 		const body = await readJson<Record<string, unknown>>(request);
 		if (!body.ok) return json({ error: body.error }, 400);
-		return unwrap(
+		return unwrapWrite(
 			await stub.createPost(token, {
 				body: String(body.value.body ?? ''),
 				author: optionalString(body.value.author),
@@ -151,14 +163,14 @@ async function routeApi(request: Request, env: Env, url: URL): Promise<Response>
 
 		if (method === 'DELETE') {
 			if (!(await allowWrite(env, token))) return rateLimited();
-			return unwrap(await stub.deletePost(token, postId));
+			return unwrapWrite(await stub.deletePost(token, postId));
 		}
 
 		if (method === 'PATCH') {
 			if (!(await allowWrite(env, token))) return rateLimited();
 			const body = await readJson<Record<string, unknown>>(request);
 			if (!body.ok) return json({ error: body.error }, 400);
-			return unwrap(
+			return unwrapWrite(
 				await stub.updatePost(token, postId, {
 					body: body.value.body === undefined ? undefined : String(body.value.body),
 					author: body.value.author === undefined ? undefined : optionalString(body.value.author),
@@ -199,11 +211,15 @@ async function createBlog(request: Request, env: Env, url: URL): Promise<Respons
 
 	// A generated slug can collide with an existing blog. Fall back to a random id
 	// rather than handing the caller someone else's blog.
+	let reservation = await reserveBlogId(env, blogId);
+	if (reservation === 'taken' && !requested) { blogId = generateBlogId(); reservation = await reserveBlogId(env, blogId); }
+	if (reservation !== 'ok') return json({ error: reservation === 'taken' ? 'That blog id is already taken.' : 'Blog creation allowance exhausted.' }, reservation === 'taken' ? 409 : 429);
 	let stub = blogStub(env, blogId);
 	let created = await stub.createBlog({ blogId, title: body.value.title, summary: body.value.summary });
 
 	if (!created.ok && created.status === 409 && !requested) {
 		blogId = generateBlogId();
+		if (await reserveBlogId(env, blogId) !== 'ok') return json({ error: 'Blog creation allowance exhausted.' }, 429);
 		stub = blogStub(env, blogId);
 		created = await stub.createBlog({ blogId, title: body.value.title, summary: body.value.summary });
 	}
@@ -223,6 +239,10 @@ async function createBlog(request: Request, env: Env, url: URL): Promise<Respons
 		},
 		201,
 	);
+}
+
+async function reserveBlogId(env: Env, blogId: string): Promise<'ok' | 'taken' | 'budget'> {
+	return await resolveBlogStub(env, blogId) ? 'taken' : directory(env).reserve(blogId);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -286,8 +306,21 @@ async function readJson<T>(request: Request): Promise<Result<T>> {
 		return { ok: false, error: 'Expected a JSON request body.', status: 415 };
 	}
 	try {
-		const parsed = (await request.json()) as T;
-		if (parsed === null || typeof parsed !== 'object') {
+		if (!request.body) return { ok: false, error: 'Expected JSON.', status: 400 };
+		const reader = request.body.getReader();
+		const chunks: Uint8Array[] = []; let size = 0;
+		try {
+			while (true) {
+				const part = await reader.read(); if (part.done) break;
+				size += part.value.byteLength;
+				if (size > 32768) { await reader.cancel(); return { ok: false, error: 'Request exceeds 32 KiB.', status: 413 }; }
+				chunks.push(part.value);
+			}
+		} finally { reader.releaseLock(); }
+		const bytes = new Uint8Array(size); let offset = 0;
+		for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+		const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as T;
+		if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
 			return { ok: false, error: 'Expected a JSON object.', status: 400 };
 		}
 		return { ok: true, value: parsed };
@@ -328,6 +361,7 @@ function withApiHeaders(response: Response): Response {
 	const headers = new Headers(response.headers);
 	headers.set('X-Content-Type-Options', 'nosniff');
 	headers.set('Referrer-Policy', 'no-referrer');
+	headers.set('X-Robots-Tag', 'noindex, nofollow');
 	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 

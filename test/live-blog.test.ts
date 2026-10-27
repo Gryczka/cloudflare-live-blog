@@ -424,7 +424,7 @@ describe('WebSocket upgrade', () => {
 	it('accepts an upgrade and reports presence', async () => {
 		const { stub } = await newBlog();
 		const response = await stub.fetch('https://example.com/socket?since=0', {
-			headers: { Upgrade: 'websocket' },
+			headers: { Upgrade: 'websocket', Origin: 'https://example.com' },
 		});
 		expect(response.status).toBe(101);
 		expect(response.webSocket).toBeTruthy();

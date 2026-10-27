@@ -21,8 +21,9 @@ export const GET: APIRoute = async (context) => {
 		return new Response('Not found', { status: 404 });
 	}
 
-	const result = await getBlogStub(validation.blogId).getSnapshot({ limit: SNAPSHOT_PAGE_SIZE });
-	if (!result.ok) {
+	const stub = await getBlogStub(validation.blogId);
+	const result = await stub?.getSnapshot({ limit: SNAPSHOT_PAGE_SIZE });
+	if (!result?.ok) {
 		return new Response('Not found', { status: 404 });
 	}
 

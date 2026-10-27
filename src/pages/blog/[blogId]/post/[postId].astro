@@ -22,12 +22,12 @@ let meta: BlogMeta | null = null;
 let error = 'That post does not exist.';
 
 if (validation.valid && postId) {
-	const stub = getBlogStub(validation.blogId);
-	const [postResult, metaResult] = await Promise.all([stub.getPost(postId), stub.getMeta()]);
-	if (postResult.ok && metaResult.ok) {
+	const stub = await getBlogStub(validation.blogId);
+	const [postResult, metaResult] = await Promise.all([stub?.getPost(postId), stub?.getMeta()]);
+	if (postResult?.ok && metaResult?.ok) {
 		post = postResult.value;
 		meta = metaResult.value;
-	} else if (!postResult.ok) {
+	} else if (postResult && !postResult.ok) {
 		error = postResult.error;
 	}
 }

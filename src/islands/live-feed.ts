@@ -31,7 +31,7 @@
  */
 
 import { renderKeyEvent, renderPost } from '../lib/render-post';
-import type { BlogMeta, Post, ServerMessage } from '../lib/protocol';
+import type { BlogMeta, Post, ServerMessage, Snapshot } from '../lib/protocol';
 
 /*
  * A note on the DOM calls below.
@@ -96,7 +96,7 @@ class LiveFeed {
 	private readonly statusLabel: HTMLElement | null;
 	private readonly readerCount: HTMLElement | null;
 	private readonly newPostsPill: HTMLButtonElement | null;
-	private readonly loadMoreButton: HTMLButtonElement | null;
+	private loadMoreButton: HTMLButtonElement | null;
 	private readonly titleEl: HTMLElement | null;
 	private readonly summaryEl: HTMLElement | null;
 
@@ -109,6 +109,7 @@ class LiveFeed {
 	private attempts = 0;
 	/** Set when we are tearing down on purpose, to suppress reconnection. */
 	private closing = false;
+	private recovering = false;
 
 	private pendingNewPosts = 0;
 
@@ -136,7 +137,7 @@ class LiveFeed {
 	/* ------------------------------- lifecycle ------------------------------ */
 
 	connect(): void {
-		if (this.closing) return;
+		if (this.closing || this.recovering || this.root.dataset.status === 'ended') return;
 		this.clearReconnect();
 
 		// Replace any previous socket without letting its handlers fire. Detaching
@@ -160,7 +161,7 @@ class LiveFeed {
 		try {
 			socket = new WebSocket(url);
 		} catch {
-			this.scheduleReconnect();
+			void this.recoverAfterDisconnect();
 			return;
 		}
 
@@ -188,12 +189,63 @@ class LiveFeed {
 			this.setStatus('offline', 'Reconnecting…');
 		};
 
-		socket.onclose = () => {
+			socket.onclose = () => {
 			this.stopPing();
 			if (this.closing || this.socket !== socket) return;
 			this.socket = null;
-			this.scheduleReconnect();
+			void this.recoverAfterDisconnect();
 		};
+	}
+
+	/** A 409 upgrade has no readable body in browsers. Recover through public HTTP. */
+	private async recoverAfterDisconnect(): Promise<void> {
+		if (this.closing || this.recovering || this.root.dataset.status === 'ended') return;
+		this.recovering = true;
+		try {
+			const response = await fetch(`/api/blogs/${encodeURIComponent(this.blogId)}/snapshot`, {
+				cache: 'no-store', headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15_000),
+			});
+			if (this.closing) return;
+			if (response.status === 404 || response.status === 410) {
+				this.closing = true;
+				this.clearReconnect();
+				this.setStatus('offline', 'Coverage unavailable');
+				return;
+			}
+			if (!response.ok) throw new Error('Snapshot unavailable');
+			const snapshot = await response.json() as Snapshot;
+			if (this.closing) return;
+			// Reconcile canonical first-page content, including edits/deletions missed offline.
+			while (this.feed?.firstChild) this.feed.removeChild(this.feed.firstChild);
+			while (this.keyEvents?.firstChild) this.keyEvents.removeChild(this.keyEvents.firstChild);
+			for (const post of [...snapshot.posts].reverse()) this.upsert(post, { announce: false });
+			while (this.keyEvents?.firstChild) this.keyEvents.removeChild(this.keyEvents.firstChild);
+			for (const post of snapshot.pinned) this.syncKeyEvent(post);
+			this.reconcileKeyEventsVisibility();
+			this.emptyState?.toggleAttribute('hidden', snapshot.posts.length > 0);
+			if (snapshot.hasMore && !this.loadMoreButton) {
+				const button = document.createElement('button');
+				button.type = 'button'; button.className = 'button'; button.dataset.loadMore = '';
+				button.textContent = 'Load earlier posts';
+				button.addEventListener('click', () => void this.loadMore());
+				this.root.appendChild(button); this.loadMoreButton = button;
+			}
+			if (this.loadMoreButton) {
+				this.loadMoreButton.hidden = !snapshot.hasMore;
+				this.loadMoreButton.disabled = false;
+				this.loadMoreButton.textContent = 'Load earlier posts';
+			}
+			this.seq = snapshot.seq;
+			this.root.dataset.seq = String(snapshot.seq);
+			this.flushPending();
+			this.setReaders(snapshot.readers);
+			this.applyMeta(snapshot.meta);
+		} catch {
+			// The same finite reconnect budget also bounds failed recovery requests.
+		} finally {
+			this.recovering = false;
+			this.scheduleReconnect();
+		}
 	}
 
 	private detach(socket: WebSocket): void {
@@ -204,7 +256,7 @@ class LiveFeed {
 	}
 
 	private scheduleReconnect(): void {
-		if (this.closing || this.reconnectTimer !== null) return;
+		if (this.closing || this.root.dataset.status === 'ended' || this.reconnectTimer !== null) return;
 
 		if (this.attempts >= MAX_RECONNECT_ATTEMPTS) {
 			this.setStatus('offline', 'Offline — refresh to reconnect');
@@ -424,6 +476,9 @@ class LiveFeed {
 
 	private markEnded(): void {
 		this.root.dataset.status = 'ended';
+		this.clearReconnect();
+		this.stopPing();
+		if (this.socket) { this.detach(this.socket); this.socket.close(1000, 'Coverage ended'); this.socket = null; }
 		document.querySelector('[data-ended-notice]')?.removeAttribute('hidden');
 		this.setStatus('ended', 'Coverage ended');
 	}
